@@ -1,0 +1,17 @@
+[package]
+name = "Barasona"
+version = "0.1.0"
+edition = "2018"
+authors = ["Ricardo Pallas <rpallas92@gmail.com>"]
+categories = ["algorithms", "asynchronous", "data-structures", "distributed-systems"]
+description = "An async implementation of the Barasona distributed replication protocol."
+homepage = "https://github.com/rpallas92/Barasona"
+keywords = ["barasona", "replication", "data-storage"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/rpallas92/Barasona"
+
+[dependencies]
+
+
+
+
