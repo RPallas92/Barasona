@@ -132,7 +132,7 @@ Although servers normally take snapshots independently, the leader must occasion
 - If instead the follower receives a snapshot that describes a prefix of its log (due to retransmission or by mistake), then log entries coveres by the snapshot are discarded but entries following the snapshot are still valid a must be kept.
 
 
-### receiver implementation: InstallSnapshot RPC
+### Receiver implementation: InstallSnapshot RPC
 1. Reply immediately if term < currentTerm.
 2. Create new snapshot file if first chunk (offset is 0).
 3. Write data into snapshot file at given offset.
