@@ -2,7 +2,9 @@
 //! A extremely performant state machine replication.
 
 pub mod barasona;
+pub mod config;
 mod core;
+pub mod error;
 pub mod metrics;
 pub mod network;
 pub mod storage;
