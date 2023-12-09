@@ -3,33 +3,51 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
-use crate::{AppData, NodeId};
+use crate::{
+    error::{BarasonaError, ChangeConfigError, ClientReadError, ClientWriteError, InitializeError},
+    AppData, AppDataResponse, NodeId,
+};
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////////////////////////////
+pub(crate) type ClientWriteResponseTx<D, R> =
+    oneshot::Sender<Result<ClientWriteResponse<R>, ClientWriteError<D>>>;
+pub(crate) type ClientReadResponseTx = oneshot::Sender<Result<(), ClientReadError>>;
+pub(crate) type ChangeMembershipTx = oneshot::Sender<Result<(), ChangeConfigError>>;
 
-/// A model of the membership configuration of the cluster.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MembershipConfig {
-    /// All members of the Barasona cluster.
-    pub members: HashSet<NodeId>,
-    /// All members of the Barasona cluster after joint consensus is finalized.
-    ///
-    /// The presence of a value here indicates that the config is in joint consensus.
-    pub members_after_consensus: Option<HashSet<NodeId>>,
-}
-
-impl MembershipConfig {
-    /// Create a new initial config containing only the given node ID.
-    pub fn new_initial(id: NodeId) -> Self {
-        let mut members = HashSet::new();
-        members.insert(id);
-        Self {
-            members,
-            members_after_consensus: None,
-        }
-    }
+/// A message coming from the Barasona API.
+pub(crate) enum BarasonaMsg<D: AppData, R: AppDataResponse> {
+    AppendEntries {
+        rpc: AppendEntriesRequest<D>,
+        tx: oneshot::Sender<Result<AppendEntriesResponse, BarasonaError>>,
+    },
+    RequestVote {
+        rpc: VoteRequest,
+        tx: oneshot::Sender<Result<VoteResponse, BarasonaError>>,
+    },
+    InstallSnapshot {
+        rpc: InstallSnapshotRequest,
+        tx: oneshot::Sender<Result<InstallSnapshotResponse, BarasonaError>>,
+    },
+    ClientWriteRequest {
+        rpc: ClientWriteRequest<D>,
+        tx: ClientWriteResponseTx<D, R>,
+    },
+    ClientReadRequest {
+        tx: ClientReadResponseTx,
+    },
+    Initialize {
+        members: HashSet<NodeId>,
+        tx: oneshot::Sender<Result<(), InitializeError>>,
+    },
+    AddNonVoter {
+        id: NodeId,
+        tx: ChangeMembershipTx,
+    },
+    ChangeMembership {
+        members: HashSet<NodeId>,
+        tx: ChangeMembershipTx,
+    },
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -139,8 +157,34 @@ pub struct EntrySnapshotPointer {
     pub membership: MembershipConfig,
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// A model of the membership configuration of the cluster.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipConfig {
+    /// All members of the Barasona cluster.
+    pub members: HashSet<NodeId>,
+    /// All members of the Barasona cluster after joint consensus is finalized.
+    ///
+    /// The presence of a value here indicates that the config is in joint consensus.
+    pub members_after_consensus: Option<HashSet<NodeId>>,
+}
+
+impl MembershipConfig {
+    /// Create a new initial config containing only the given node ID.
+    pub fn new_initial(id: NodeId) -> Self {
+        let mut members = HashSet::new();
+        members.insert(id);
+        Self {
+            members,
+            members_after_consensus: None,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// A RPC send by candidates to gather votes.
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,3 +239,48 @@ pub struct InstallSnapshotResponse {
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// An application specific client request to update the state of the system.
+///
+/// The entry of this payload will be appended to the Barasona log and  applied to the Barasona state
+/// machine according to the Barasona protocol.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientWriteRequest<D: AppData> {
+    /// The application specific contents of this client request.
+    #[serde(bound = "D: AppData")]
+    pub(crate) entry: EntryPayload<D>,
+}
+
+impl<D: AppData> ClientWriteRequest<D> {
+    /// Create a new client payload instance with a normal entry type.
+    pub fn new(entry: D) -> Self {
+        Self::new_base(EntryPayload::Normal(EntryNormal { data: entry }))
+    }
+
+    /// Create a new instance.
+    pub(crate) fn new_base(entry: EntryPayload<D>) -> Self {
+        Self { entry }
+    }
+
+    /// Generate a new payload holding a config change.
+    pub(crate) fn new_config(membership: MembershipConfig) -> Self {
+        Self::new_base(EntryPayload::ConfigChange(EntryConfigChange { membership }))
+    }
+
+    /// Generate a new blank payload.
+    ///
+    /// This is used by new leaders when first coming to power.
+    pub(crate) fn new_blank_payload() -> Self {
+        Self::new_base(EntryPayload::Blank)
+    }
+}
+
+/// The response to a `ClientRequest`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientWriteResponse<R: AppDataResponse> {
+    /// The log index of the successfully processed client request.
+    pub index: u64,
+    /// Application specific response data.
+    #[serde(bound = "R: AppDataResponse")]
+    pub data: R,
+}

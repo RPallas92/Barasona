@@ -20,7 +20,7 @@ pub struct BarasonaMetrics {
     pub state: State,
     /// The current term of the a node.
     pub current_term: u64,
-    /// The last log index to be appended to this Raft node's log.
+    /// The last log index to be appended to this Barasona node's log.
     pub last_log_index: u64,
     /// The current cluster leader.
     pub current_leader: Option<NodeId>,
