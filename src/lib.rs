@@ -7,6 +7,7 @@ mod core;
 pub mod error;
 pub mod metrics;
 pub mod network;
+mod replication;
 pub mod storage;
 
 use serde::{de::DeserializeOwned, Serialize};

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::stream::{AbortHandle, FuturesOrdered};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use crate::{
     barasona::Entry,
     barasona::{BarasonaMsg, MembershipConfig},
     config::BarasonaConfig,
+    error::{BarasonaError, BarasonaResult},
     metrics::BarasonaMetrics,
     network::BarasonaNetwork,
     storage::BarasonaStorage,
@@ -29,13 +30,13 @@ where
     /// This node's ID.
     id: NodeId,
     /// This node's runtime config
-    config: BarasonaConfig,
+    config: Arc<BarasonaConfig>,
     /// The cluster's current membership configuration.
     membership: MembershipConfig,
     /// The `BarasonaNetwork` implementation.
-    network: N,
+    network: Arc<N>,
     /// The `BarasonaStorage` implementation.
-    storage: S,
+    storage: Arc<S>,
     /// The target state of a node
     target_state: State,
     /// The index of the highest log entry known to be committed cluster-wide.
@@ -107,6 +108,134 @@ where
     /// A oneshot receiver channel used to signal the Barasona node to shut down. The Barasona node may be
     /// gracefully shut down when this channel receives a signal.
     rx_shutdown: oneshot::Receiver<()>,
+}
+
+impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    BarasonaCore<D, R, N, S>
+{
+    pub(crate) fn spawn(
+        id: NodeId,
+        config: Arc<BarasonaConfig>,
+        network: Arc<N>,
+        storage: Arc<S>,
+        rx_api: mpsc::UnboundedReceiver<BarasonaMsg<D, R>>,
+        tx_metrics: watch::Sender<BarasonaMetrics>,
+        rx_shutdown: oneshot::Receiver<()>,
+    ) -> JoinHandle<BarasonaResult<()>> {
+        let membership = MembershipConfig::new_initial(id);
+        let (tx_compaction, rx_compaction) = mpsc::channel(1);
+        let this = Self {
+            id,
+            config,
+            membership,
+            network,
+            storage,
+            target_state: State::Follower,
+            commit_index: 0,
+            current_term: 0,
+            current_leader: None,
+            voted_for: None,
+            last_log_index: 0,
+            last_log_term: 0,
+            snapshot_state: None,
+            snapshot_index: 0,
+            entries_cache: Default::default(),
+            replicate_to_sm_handle: FuturesOrdered::new(),
+            has_completed_initial_replication_to_sm: false,
+            last_heartbeat: None,
+            next_election_timeout: None,
+            tx_compaction,
+            rx_compaction,
+            rx_api,
+            tx_metrics,
+            rx_shutdown,
+        };
+
+        tokio::spawn(this.main())
+    }
+
+    /// The main loop of the Barasona protocol.
+    #[tracing::instrument(level="trace", skip(self), fields(id=self.id, cluster=%self.config.cluster_name))]
+    async fn main(mut self) -> BarasonaResult<()> {
+        tracing::trace!("Barasona node is initializing");
+        let state = self
+            .storage
+            .get_initial_state()
+            .await
+            .map_err(|err| self.map_fatal_storage_error(err))?;
+        self.last_log_index = state.last_log_index;
+        self.last_log_term = state.last_log_term;
+        self.current_term = state.persistent_state.current_term;
+        self.voted_for = state.persistent_state.voted_for;
+        self.membership = state.membership;
+        // NOTE: this is repeated here for clarity. It is unsafe to initialize the node's commit
+        // index to any other value. The commit index must be determined by a leader after
+        // successfully committing a new log to the cluster.
+        self.commit_index = 0;
+
+        // Fetch the most recent snapshot in the system.
+        if let Some(snapshot) = self
+            .storage
+            .get_current_snapshot()
+            .await
+            .map_err(|err| self.map_fatal_storage_error(err))?
+        {
+            self.snapshot_index = snapshot.index;
+        }
+
+        // Set initial state based on state recovered from disk.
+        let is_only_configured_member =
+            self.membership.members.len() == 1 && self.membership.contains(&self.id);
+
+        // If this is the only configured member and there is live state, then this is
+        // a single-node cluster. Become leader.
+        // TODO Ricardo why min_value if last log index should be 0 if the first one, right?
+        if is_only_configured_member && self.last_log_index != u64::min_value() {
+            self.target_state = State::Leader;
+        }
+        // Else if there are other members, that can only mean that state was recovered. Become follower.
+        // Here we use a 30 second overhead on the initial next_election_timeout. This is because we need
+        // to ensure that restarted nodes don't disrupt a stable cluster by timing out and driving up their
+        // term before network communication is established.
+        else if !is_only_configured_member && self.membership.contains(&self.id) {
+            self.target_state = State::Follower;
+            let inst = Instant::now()
+                + Duration::from_secs(30)
+                + Duration::from_millis(self.config.new_rand_election_timeout_ms());
+            self.next_election_timeout = Some(inst);
+        }
+        // Else, for any other condition, stay non-voter.
+        else {
+            self.target_state = State::NonVoter;
+        }
+
+        // TODO Ricardo continue here
+        // TODO Ricardo I first need to implement the replication module as it is called by this module
+
+        loop {}
+    }
+
+    /// Update core's target state, ensuring all invariants are upheld.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn set_target_state(&mut self, target_state: State) {
+        if target_state == State::Follower && !self.membership.contains(&self.id) {
+            self.target_state = State::NonVoter;
+        } else {
+            self.target_state = target_state;
+        }
+    }
+
+    /// Trigger the shutdown sequence due to a non-recoverable error from the storage layer.
+    ///
+    /// This method assumes that a storage error observed here is non-recoverable. As such, the
+    /// Barasona node will be instructed to stop. If such behavior is not needed, then don't use this
+    /// interface.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn map_fatal_storage_error(&mut self, err: anyhow::Error) -> BarasonaError {
+        tracing::error!({error=%err, id=self.id}, "fatal storage error, shutting down");
+        self.set_target_state(State::Shutdown);
+        BarasonaError::BarasonaStorage(err)
+    }
 }
 
 /// The current snapshot state of the Barasona node.

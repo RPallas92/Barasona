@@ -172,6 +172,18 @@ pub struct MembershipConfig {
 }
 
 impl MembershipConfig {
+    /// Check if the given NodeId exists in this membership config.
+    ///
+    /// When in joint consensus, this will check both config groups.
+    pub fn contains(&self, x: &NodeId) -> bool {
+        self.members.contains(x)
+            || if let Some(members) = &self.members_after_consensus {
+                members.contains(x)
+            } else {
+                false
+            }
+    }
+
     /// Create a new initial config containing only the given node ID.
     pub fn new_initial(id: NodeId) -> Self {
         let mut members = HashSet::new();
