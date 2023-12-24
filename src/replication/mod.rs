@@ -1,15 +1,15 @@
-use std::{sync::Arc, time::Duration};
+use std::{cmp::min, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncRead, AsyncSeek},
     sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::{interval, Interval},
+    time::{interval, timeout, Interval},
 };
 
 use crate::{
-    barasona::Entry,
-    config::BarasonaConfig,
+    barasona::{AppendEntriesRequest, Entry},
+    config::{BarasonaConfig, SnapshotPolicy},
     network::BarasonaNetwork,
     storage::{BarasonaStorage, CurrentSnapshotData},
     AppData, AppDataResponse, NodeId,
@@ -180,7 +180,180 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
 
     #[tracing::instrument(level="trace", skip(self), fields(id=self.id, target=self.target, cluster=%self.config.cluster_name))]
     async fn main(mut self) {
+        // TODO Ricardo implement
         loop {}
+    }
+
+    /// Send an AppendEntries RPC to the target.
+    ///
+    /// This request will timeout if no response is received within the
+    /// configured heartbeat interval.
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn send_append_entries(&mut self) {
+        // Attempt to fill the send buffer from the replication buffer
+        if self.outbound_buffer.is_empty() {
+            let repl_len = self.replication_buffer.len();
+            if repl_len > 0 {
+                let chunk_size = min(repl_len, self.max_payload_entries);
+                self.outbound_buffer.extend(
+                    self.replication_buffer
+                        .drain(..chunk_size)
+                        .map(OutboundEntry::Arc),
+                );
+            }
+        }
+
+        // Build the heartbeat frame to be sent to the follower.
+        let payload = AppendEntriesRequest {
+            term: self.term,
+            leader_id: self.id,
+            prev_log_index: self.match_index,
+            prev_log_term: self.match_term,
+            leader_commit: self.commit_index,
+            entries: self
+                .outbound_buffer
+                .iter()
+                .map(|entry| entry.as_ref().clone())
+                .collect(),
+        };
+
+        // Send the payload.
+        let res = match timeout(
+            self.heartbeat_timeout,
+            self.network.append_entries(self.target, payload),
+        )
+        .await
+        {
+            Ok(outer_res) => match outer_res {
+                Ok(res) => res,
+                Err(err) => {
+                    tracing::error!({error=%err}, "error sending AppendEntries RPC to target");
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::error!({error=%err}, "timeout while sending AppendEntries RPC to target");
+                return;
+            }
+        };
+        let last_index_and_term = self
+            .outbound_buffer
+            .last()
+            .map(|last| (last.as_ref().index, last.as_ref().term));
+        self.outbound_buffer.clear(); // Once we've successfully sent a payload of entries, don't send them again.
+
+        // Handle success conditions.
+        if res.success {
+            tracing::trace!("append entries succedeed");
+            // If this was a proper replication event (last index & term were provided), then update state.
+            if let Some((index, term)) = last_index_and_term {
+                self.next_index = index + 1; // This should always be the next expected index.
+                self.match_index = index;
+                self.match_term = term;
+                let _ = self.barasona_tx.send(ReplicaEvent::UpdateMatchIndex {
+                    target: self.target,
+                    match_index: index,
+                    match_term: term,
+                });
+
+                // If running at line rate, and our buffered outbound requests have accumulated too
+                // much, we need to purge and transition to a lagging state. The target is not able to
+                // replicate data fast enough.
+                let is_lagging = self
+                    .last_log_index
+                    .checked_sub(self.match_index)
+                    .map(|diff| diff > self.config.replication_lag_threshold)
+                    .unwrap_or(false);
+                if is_lagging {
+                    self.target_state = TargetReplState::Lagging;
+                }
+            }
+            return;
+        }
+
+        // Replication was not successful, if a newer term has been returned, revert to follower.
+        if res.term > self.term {
+            tracing::trace!({ res.term }, "append entries failed, reverting to follower");
+            let _ = self.barasona_tx.send(ReplicaEvent::RevertToFollower {
+                target: self.target,
+                term: res.term,
+            });
+            self.target_state = TargetReplState::Shutdown;
+            return;
+        }
+
+        // Replication was not successful, handle conflict optimization record, else decrement `next_index`.
+        if let Some(conflict) = res.conflict_opt {
+            tracing::trace!({?conflict, res.term}, "append entries failed, handling conflict opt");
+            // If the returned conflict opt index is greater than last_log_index, then this is a
+            // logical error, and no action should be taken. This represents a replication failure.
+            if conflict.index > self.last_log_index {
+                return;
+            }
+            self.next_index = conflict.index + 1;
+            self.match_index = conflict.index;
+            self.match_term = conflict.term;
+
+            // If conflict index is 0, we will not be able to fetch that index from storage because
+            // it will never exist. So instead, we just return, and accept the conflict data.
+            if conflict.index == 0 {
+                self.target_state = TargetReplState::Lagging;
+                let _ = self.barasona_tx.send(ReplicaEvent::UpdateMatchIndex {
+                    target: self.target,
+                    match_index: self.match_index,
+                    match_term: self.match_term,
+                });
+                return;
+            }
+
+            // Fetch the entry at conflict index and use the term specified there.
+            match self
+                .storage
+                .get_log_entries(conflict.index, conflict.index + 1)
+                .await
+                .map(|entries| entries.get(0).map(|entry| entry.term))
+            {
+                Ok(Some(term)) => {
+                    self.match_term = term; // If we have the specified log, ensure we use its term.
+                }
+                Ok(None) => {
+                    // This condition would only ever be reached if the log has been removed due to
+                    // log compaction (barring critical storage failure), so transition to snapshotting.
+                    self.target_state = TargetReplState::Snapshotting;
+                    let _ = self.barasona_tx.send(ReplicaEvent::UpdateMatchIndex {
+                        target: self.target,
+                        match_index: self.match_index,
+                        match_term: self.match_term,
+                    });
+                    return;
+                }
+                Err(err) => {
+                    tracing::error!({error=%err}, "error fetching log entry due to returned AppendEntries RPC conflict_opt");
+                    let _ = self.barasona_tx.send(ReplicaEvent::Shutdown);
+                    self.target_state = TargetReplState::Shutdown;
+                    return;
+                }
+            };
+
+            let _ = self.barasona_tx.send(ReplicaEvent::UpdateMatchIndex {
+                target: self.target,
+                match_index: self.match_index,
+                match_term: self.match_term,
+            });
+            match &self.config.snapshot_policy {
+                SnapshotPolicy::LogsSinceLast(threshold) => {
+                    let diff = self.last_log_index - conflict.index; // NOTE WELL: underflow is guarded against above.
+                    if &diff >= threshold {
+                        // Follower is far behind and needs to receive an InstallSnapshot RPC.
+                        self.target_state = TargetReplState::Snapshotting;
+                        return;
+                    }
+                    // Follower is behind, but not too far behind to receive an InstallSnapshot RPC.
+                    self.target_state = TargetReplState::Lagging;
+                    return;
+                }
+            }
+        }
     }
 }
 
