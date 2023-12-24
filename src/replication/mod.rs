@@ -1,5 +1,6 @@
 use std::{cmp::min, sync::Arc, time::Duration};
 
+use futures::FutureExt;
 use tokio::{
     io::{AsyncRead, AsyncSeek},
     sync::{mpsc, oneshot},
@@ -180,6 +181,9 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
 
     #[tracing::instrument(level="trace", skip(self), fields(id=self.id, target=self.target, cluster=%self.config.cluster_name))]
     async fn main(mut self) {
+        // Perform an initial heartbeat.
+        self.send_append_entries().await;
+
         // TODO Ricardo implement
         loop {}
     }
@@ -353,6 +357,70 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
                     return;
                 }
             }
+        }
+    }
+
+    /// Perform a check to see if this replication stream is lagging behind far enough that a
+    /// snapshot is warranted.
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub(self) fn needs_snapshot(&self) -> bool {
+        match &self.config.snapshot_policy {
+            SnapshotPolicy::LogsSinceLast(threshold) => {
+                let needs_snap = self
+                    .commit_index
+                    .checked_sub(self.match_index)
+                    .map(|diff| diff >= *threshold)
+                    .unwrap_or(false);
+                if needs_snap {
+                    tracing::trace!("snapshot needed");
+                    true
+                } else {
+                    tracing::trace!("snapshot not needed");
+                    false
+                }
+            }
+        }
+    }
+
+    /// Fully drain the channel coming in from the Barasona node.
+    pub(self) fn drain_raftrx(&mut self, first: BarasonaEvent<D>) {
+        let mut event_opt = Some(first);
+        let mut iters = 0;
+        loop {
+            // Just ensure we don't get stuck draining a REALLY hot replication feed.
+            if iters > self.config.max_payload_entries {
+                return;
+            }
+            // Unpack the event opt, else return if we don't have one to process.
+            let event: BarasonaEvent<D> = match event_opt.take() {
+                Some(event) => event,
+                None => return,
+            };
+            // Process the event.
+            match event {
+                BarasonaEvent::UpdateCommitIndex { commit_index } => {
+                    self.commit_index = commit_index;
+                }
+                BarasonaEvent::Replicate {
+                    entry,
+                    commit_index,
+                } => {
+                    self.commit_index = commit_index;
+                    self.last_log_index = entry.index;
+                    if self.target_state == TargetReplState::LineRate {
+                        self.replication_buffer.push(entry);
+                    }
+                }
+                BarasonaEvent::Terminate => {
+                    self.target_state = TargetReplState::Shutdown;
+                    return;
+                }
+            }
+            // Attempt to unpack the next event for the next loop iteration.
+            if let Some(event) = self.barasona_rx.recv().now_or_never() {
+                event_opt = event;
+            }
+            iters += 1;
         }
     }
 }
