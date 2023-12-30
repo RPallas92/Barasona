@@ -1,16 +1,17 @@
-use std::{cmp::min, sync::Arc, time::Duration};
+use std::{cmp::min, io::SeekFrom, sync::Arc, time::Duration};
 
 use futures::FutureExt;
 use tokio::{
-    io::{AsyncRead, AsyncSeek},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{interval, timeout, Interval},
 };
 
 use crate::{
-    barasona::{AppendEntriesRequest, Entry},
+    barasona::{AppendEntriesRequest, Entry, EntryPayload, InstallSnapshotRequest},
     config::{BarasonaConfig, SnapshotPolicy},
+    error::BarasonaResult,
     network::BarasonaNetwork,
     storage::{BarasonaStorage, CurrentSnapshotData},
     AppData, AppDataResponse, NodeId,
@@ -38,7 +39,18 @@ impl<D: AppData> ReplicationStream<D> {
         storage: Arc<S>,
         replication_tx: mpsc::UnboundedSender<ReplicaEvent<S::Snapshot>>,
     ) -> Self {
-        // TODO Ricardo continue here
+        ReplicationCore::spawn(
+            id,
+            target,
+            term,
+            config,
+            last_log_index,
+            last_log_term,
+            commit_index,
+            network,
+            storage,
+            replication_tx,
+        )
     }
 }
 
@@ -184,8 +196,15 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         // Perform an initial heartbeat.
         self.send_append_entries().await;
 
-        // TODO Ricardo implement
-        loop {}
+        // Proceed to the replication stream's inner loop.
+        loop {
+            match &self.target_state {
+                TargetReplState::LineRate => LineRateState::new(&mut self).run().await,
+                TargetReplState::Lagging => LaggingState::new(&mut self).run().await,
+                TargetReplState::Snapshotting => SnapshottingState::new(&mut self).run().await,
+                TargetReplState::Shutdown => return,
+            }
+        }
     }
 
     /// Send an AppendEntries RPC to the target.
@@ -383,7 +402,7 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
     }
 
     /// Fully drain the channel coming in from the Barasona node.
-    pub(self) fn drain_raftrx(&mut self, first: BarasonaEvent<D>) {
+    pub(self) fn drain_barasona_rx(&mut self, first: BarasonaEvent<D>) {
         let mut event_opt = Some(first);
         let mut iters = 0;
         loop {
@@ -522,3 +541,390 @@ where
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// LineRate specific state.
+struct LineRateState<
+    'a,
+    D: AppData,
+    R: AppDataResponse,
+    N: BarasonaNetwork<D>,
+    S: BarasonaStorage<D, R>,
+> {
+    /// An exclusive handle to the replication core.
+    core: &'a mut ReplicationCore<D, R, N, S>,
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    LineRateState<'a, D, R, N, S>
+{
+    /// Create a new instance.
+    pub fn new(core: &'a mut ReplicationCore<D, R, N, S>) -> Self {
+        Self { core }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(state = "line-rate"))]
+    pub async fn run(mut self) {
+        let event = ReplicaEvent::RateUpdate {
+            target: self.core.target,
+            is_line_rate: true,
+        };
+        let _ = self.core.barasona_tx.send(event);
+        loop {
+            if self.core.target_state != TargetReplState::LineRate {
+                return;
+            }
+
+            // We always prioritize draining our buffers first.
+            let next_buf_index = self
+                .core
+                .outbound_buffer
+                .first()
+                .map(|entry| entry.as_ref().index)
+                .or_else(|| {
+                    self.core
+                        .replication_buffer
+                        .first()
+                        .map(|entry| entry.index)
+                });
+            if let Some(index) = next_buf_index {
+                // Ensure that our buffered data matches up with `next_index`. When transitioning to
+                // line rate, it is always possible that new data has been sent for replication but has
+                // skipped this replication stream during transition. In such cases, a single update from
+                // storage will put this stream back on track.
+                if self.core.next_index != index {
+                    self.frontload_outbound_buffer(self.core.next_index, index)
+                        .await;
+                    if self.core.target_state != TargetReplState::LineRate {
+                        return;
+                    }
+                }
+
+                self.core.send_append_entries().await;
+                continue;
+            }
+            tokio::select! {
+                _ = self.core.heartbeat.tick() => self.core.send_append_entries().await,
+                event = self.core.barasona_rx.recv() => match event {
+                    Some(event) => self.core.drain_barasona_rx(event),
+                    None => self.core.target_state = TargetReplState::Shutdown,
+                }
+            }
+        }
+    }
+
+    /// Ensure there are no gaps in the outbound buffer due to transition from lagging.
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn frontload_outbound_buffer(&mut self, start: u64, stop: u64) {
+        let entries = match self.core.storage.get_log_entries(start, stop).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::error!({error=%err}, "error while frontloading outbound buffer");
+                let _ = self.core.barasona_tx.send(ReplicaEvent::Shutdown);
+                return;
+            }
+        };
+        for entry in entries.iter() {
+            if let EntryPayload::SnapshotPointer(_) = entry.payload {
+                self.core.target_state = TargetReplState::Snapshotting;
+                return;
+            }
+        }
+        // Prepend.
+        self.core.outbound_buffer.reverse();
+        self.core
+            .outbound_buffer
+            .extend(entries.into_iter().rev().map(OutboundEntry::Raw));
+        self.core.outbound_buffer.reverse();
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Lagging specific state.
+struct LaggingState<
+    'a,
+    D: AppData,
+    R: AppDataResponse,
+    N: BarasonaNetwork<D>,
+    S: BarasonaStorage<D, R>,
+> {
+    /// An exclusive handle to the replication core.
+    core: &'a mut ReplicationCore<D, R, N, S>,
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    LaggingState<'a, D, R, N, S>
+{
+    /// Create a new instance.
+    pub fn new(core: &'a mut ReplicationCore<D, R, N, S>) -> Self {
+        Self { core }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(state = "lagging"))]
+    pub async fn run(mut self) {
+        let event = ReplicaEvent::RateUpdate {
+            target: self.core.target,
+            is_line_rate: false,
+        };
+        let _ = self.core.barasona_tx.send(event);
+        self.core.replication_buffer.clear();
+        self.core.outbound_buffer.clear();
+        loop {
+            if self.core.target_state != TargetReplState::Lagging {
+                return;
+            }
+            // If this stream is far enough behind, then transition to snapshotting state.
+            if self.core.needs_snapshot() {
+                self.core.target_state = TargetReplState::Snapshotting;
+                return;
+            }
+
+            // Prep entries from storage and send them off for replication.
+            if self.is_up_to_speed() {
+                self.core.target_state = TargetReplState::LineRate;
+                return;
+            }
+            self.prep_outbound_buffer_from_storage().await;
+            self.core.send_append_entries().await;
+            if self.is_up_to_speed() {
+                self.core.target_state = TargetReplState::LineRate;
+                return;
+            }
+
+            // Check Barasona channel to ensure we are staying up-to-date, then loop.
+            if let Some(Some(event)) = self.core.barasona_rx.recv().now_or_never() {
+                self.core.drain_barasona_rx(event);
+            }
+        }
+    }
+
+    /// Check if this replication stream is now up-to-speed.
+    #[tracing::instrument(level="trace", skip(self), fields(self.core.next_index, self.core.commit_index))]
+    fn is_up_to_speed(&self) -> bool {
+        self.core.next_index > self.core.commit_index
+    }
+
+    /// Prep the outbound buffer with the next payload of entries to append.
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn prep_outbound_buffer_from_storage(&mut self) {
+        // If the send buffer is empty, we need to fill it.
+        if self.core.outbound_buffer.is_empty() {
+            // Determine an appropriate stop index for the storage fetch operation. Avoid underflow.
+            let distance_behind = self.core.commit_index - self.core.next_index; // Underflow is guarded against in the `is_up_to_speed` check in the outer loop.
+            let is_within_payload_distance =
+                distance_behind <= self.core.config.max_payload_entries;
+            let stop_idx = if is_within_payload_distance {
+                // If we have caught up to the line index, then that means we will be running at
+                // line rate after this payload is successfully replicated.
+                self.core.target_state = TargetReplState::LineRate; // Will continue in lagging state until the outer loop cycles.
+                self.core.commit_index + 1 // +1 to ensure stop value is included.
+            } else {
+                self.core.next_index + self.core.config.max_payload_entries + 1 // +1 to ensure stop value is included.
+            };
+
+            // Bringing the target up-to-date by fetching the largest possible payload of entries
+            // from storage within permitted configuration & ensure no snapshot pointer was returned.
+            let entries = match self
+                .core
+                .storage
+                .get_log_entries(self.core.next_index, stop_idx)
+                .await
+            {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::error!({error=%err}, "error fetching logs from storage");
+                    let _ = self.core.barasona_tx.send(ReplicaEvent::Shutdown);
+                    self.core.target_state = TargetReplState::Shutdown;
+                    return;
+                }
+            };
+            for entry in entries.iter() {
+                if let EntryPayload::SnapshotPointer(_) = entry.payload {
+                    self.core.target_state = TargetReplState::Snapshotting;
+                    return;
+                }
+            }
+            self.core
+                .outbound_buffer
+                .extend(entries.into_iter().map(OutboundEntry::Raw));
+        }
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Snapshotting specific state.
+struct SnapshottingState<
+    'a,
+    D: AppData,
+    R: AppDataResponse,
+    N: BarasonaNetwork<D>,
+    S: BarasonaStorage<D, R>,
+> {
+    /// An exclusive handle to the replication core.
+    core: &'a mut ReplicationCore<D, R, N, S>,
+    snapshot: Option<CurrentSnapshotData<S::Snapshot>>,
+    snapshot_fetch_rx: Option<oneshot::Receiver<CurrentSnapshotData<S::Snapshot>>>,
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    SnapshottingState<'a, D, R, N, S>
+{
+    /// Create a new instance.
+    pub fn new(core: &'a mut ReplicationCore<D, R, N, S>) -> Self {
+        Self {
+            core,
+            snapshot: None,
+            snapshot_fetch_rx: None,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(state = "snapshotting"))]
+    pub async fn run(mut self) {
+        let event = ReplicaEvent::RateUpdate {
+            target: self.core.target,
+            is_line_rate: false,
+        };
+        let _ = self.core.barasona_tx.send(event);
+        self.core.replication_buffer.clear();
+        self.core.outbound_buffer.clear();
+
+        loop {
+            if self.core.target_state != TargetReplState::Snapshotting {
+                return;
+            }
+
+            // If we don't have any of the components we need, fetch the current snapshot.
+            if self.snapshot.is_none() && self.snapshot_fetch_rx.is_none() {
+                let (tx, rx) = oneshot::channel();
+                let _ = self.core.barasona_tx.send(ReplicaEvent::NeedsSnapshot {
+                    target: self.core.target,
+                    tx,
+                });
+                self.snapshot_fetch_rx = Some(rx);
+            }
+
+            // If we are waiting for a snapshot response from the storage layer, then wait for
+            // it and send heartbeats in the meantime.
+            if let Some(snapshot_fetch_rx) = self.snapshot_fetch_rx.take() {
+                self.wait_for_snapshot(snapshot_fetch_rx).await;
+                continue;
+            }
+
+            // If we have a snapshot to work with, then stream it.
+            if let Some(snapshot) = self.snapshot.take() {
+                if let Err(err) = self.stream_snapshot(snapshot).await {
+                    tracing::error!({error=%err}, "error streaming snapshot to target");
+                }
+                continue;
+            }
+        }
+    }
+
+    /// Wait for a response from the storage layer for the current snapshot.
+    ///
+    /// If an error comes up during processing, this routine should simple be called again after
+    /// issuing a new request to the storage layer.
+    #[tracing::instrument(level = "trace", skip(self, rx))]
+    async fn wait_for_snapshot(
+        &mut self,
+        mut rx: oneshot::Receiver<CurrentSnapshotData<S::Snapshot>>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = self.core.heartbeat.tick() => self.core.send_append_entries().await,
+                event = self.core.barasona_rx.recv() => match event {
+                    Some(event) => self.core.drain_barasona_rx(event),
+                    None => {
+                        self.core.target_state = TargetReplState::Shutdown;
+                        return;
+                    }
+                },
+                res = &mut rx => {
+                    match res {
+                        Ok(snapshot) => {
+                            self.snapshot = Some(snapshot);
+                            return;
+                        }
+                        Err(_) => return, // Channels may close for various acceptable reasons.
+                    }
+                },
+            }
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, snapshot))]
+    async fn stream_snapshot(
+        &mut self,
+        mut snapshot: CurrentSnapshotData<S::Snapshot>,
+    ) -> BarasonaResult<()> {
+        let mut offset = 0;
+        self.core.next_index = snapshot.index + 1;
+        self.core.match_index = snapshot.index;
+        self.core.match_term = snapshot.term;
+        let mut buf = Vec::with_capacity(self.core.config.snapshot_max_chunk_size_mib as usize);
+        loop {
+            // Build the RPC.
+            snapshot.snapshot.seek(SeekFrom::Start(offset)).await?;
+            let nread = snapshot.snapshot.read_buf(&mut buf).await?;
+            let done = nread == 0; // If bytes read == 0, then we're done.
+            let req = InstallSnapshotRequest {
+                term: self.core.term,
+                leader_id: self.core.id,
+                last_included_index: snapshot.index,
+                last_included_term: snapshot.term,
+                offset,
+                data: Vec::from(&buf[..nread]),
+                done,
+            };
+            buf.clear();
+
+            // Send the RPC over to the target.
+            tracing::trace!({snapshot_size=req.data.len(), nread, req.done, req.offset}, "sending snapshot chunk");
+            let res = match timeout(
+                self.core.heartbeat_timeout,
+                self.core.network.install_snapshot(self.core.target, req),
+            )
+            .await
+            {
+                Ok(outer_res) => match outer_res {
+                    Ok(res) => res,
+                    Err(err) => {
+                        tracing::error!({error=%err}, "error sending InstallSnapshot RPC to target");
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    tracing::error!({error=%err}, "timeout while sending InstallSnapshot RPC to target");
+                    continue;
+                }
+            };
+
+            // Handle response conditions.
+            if res.term > self.core.term {
+                let _ = self.core.barasona_tx.send(ReplicaEvent::RevertToFollower {
+                    target: self.core.target,
+                    term: res.term,
+                });
+                self.core.target_state = TargetReplState::Shutdown;
+                return Ok(());
+            }
+
+            // If we just sent the final chunk of the snapshot, then transition to lagging state.
+            if done {
+                self.core.target_state = TargetReplState::Lagging;
+                return Ok(());
+            }
+
+            // Everything is good, so update offset for sending the next chunk.
+            offset += nread as u64;
+
+            // Check Barasona channel to ensure we are staying up-to-date, then loop.
+            if let Some(Some(event)) = self.core.barasona_rx.recv().now_or_never() {
+                self.core.drain_barasona_rx(event);
+            }
+        }
+    }
+}
