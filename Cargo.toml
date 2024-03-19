@@ -13,6 +13,7 @@ repository = "https://github.com/rpallas92/Barasona"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1.36"
+derive_more = { version="0.99.9", default-features=false, features=["from"] }
 futures = "0.3"
 log = "0.4.6"
 rand = "0.8.5"

@@ -1,3 +1,8 @@
+//! The core logic of a Barasona node.
+
+mod client;
+mod vote;
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::stream::{AbortHandle, FuturesOrdered};
@@ -12,12 +17,15 @@ use crate::{
     barasona::Entry,
     barasona::{BarasonaMsg, MembershipConfig},
     config::BarasonaConfig,
-    error::{BarasonaError, BarasonaResult},
+    error::{BarasonaError, BarasonaResult, ChangeConfigError},
     metrics::BarasonaMetrics,
     network::BarasonaNetwork,
-    storage::BarasonaStorage,
+    replication::{ReplicaEvent, ReplicationStream},
+    storage::{BarasonaStorage, PersistentState},
     AppData, AppDataResponse, NodeId,
 };
+
+use self::client::ClientRequestEntry;
 
 /// The core type implementing the Barasona protocol
 pub struct BarasonaCore<D, R, N, S>
@@ -215,6 +223,36 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         loop {}
     }
 
+    /// Report a metrics payload on the current state of the Barasona node.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn report_metrics(&mut self) {
+        let res = self.tx_metrics.send(BarasonaMetrics {
+            id: self.id,
+            state: self.target_state,
+            current_term: self.current_term,
+            last_log_index: self.last_log_index,
+            current_leader: self.current_leader,
+            membership_config: self.membership.clone(),
+        });
+        if let Err(err) = res {
+            tracing::error!({error=%err, id=self.id}, "error reporting metrics");
+        }
+    }
+
+    /// Save the Barasona node's current hard state to disk.
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn save_hard_state(&mut self) -> BarasonaResult<()> {
+        let hs = PersistentState {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+        };
+        Ok(self
+            .storage
+            .save_persistent_state(&hs)
+            .await
+            .map_err(|err| self.map_fatal_storage_error(err))?)
+    }
+
     /// Update core's target state, ensuring all invariants are upheld.
     #[tracing::instrument(level = "trace", skip(self))]
     fn set_target_state(&mut self, target_state: State) {
@@ -222,6 +260,59 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
             self.target_state = State::NonVoter;
         } else {
             self.target_state = target_state;
+        }
+    }
+
+    /// Get the next election timeout, generating a new value if not set.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn get_next_election_timeout(&mut self) -> Instant {
+        match self.next_election_timeout {
+            Some(inst) => inst,
+            None => {
+                let inst = Instant::now()
+                    + Duration::from_millis(self.config.new_rand_election_timeout_ms());
+                self.next_election_timeout = Some(inst);
+                inst
+            }
+        }
+    }
+
+    /// Set a value for the next election timeout.
+    ///
+    /// If `heartbeat=true`, then also update the value of `last_heartbeat`.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn update_next_election_timeout(&mut self, heartbeat: bool) {
+        let now = Instant::now();
+        self.next_election_timeout =
+            Some(now + Duration::from_millis(self.config.new_rand_election_timeout_ms()));
+        if heartbeat {
+            self.last_heartbeat = Some(now);
+        }
+    }
+
+    /// Update the value of the `current_leader` property.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn update_current_leader(&mut self, update: UpdateCurrentLeader) {
+        self.entries_cache.clear();
+        match update {
+            UpdateCurrentLeader::ThisNode => {
+                self.current_leader = Some(self.id);
+            }
+            UpdateCurrentLeader::OtherNode(target) => {
+                self.current_leader = Some(target);
+            }
+            UpdateCurrentLeader::Unknown => {
+                self.current_leader = None;
+            }
+        }
+    }
+
+    /// Encapsulate the process of updating the current term, as updating the `voted_for` state must also be updated.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn update_current_term(&mut self, new_term: u64, voted_for: Option<NodeId>) {
+        if new_term > self.current_term {
+            self.current_term = new_term;
+            self.voted_for = voted_for;
         }
     }
 
@@ -236,6 +327,36 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         self.set_target_state(State::Shutdown);
         BarasonaError::BarasonaStorage(err)
     }
+
+    /// Update the node's current membership config & save hard state.
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn update_membership(&mut self, cfg: MembershipConfig) -> BarasonaResult<()> {
+        // If the given config does not contain this node's ID, it means one of the following:
+        //
+        // - The node is currently a non-voter and is replicating an old config to which it has
+        // not yet been added.
+        // - The node has been removed from the cluster. The parent application can observe the
+        // transition to the non-voter state as a signal for when it is safe to shutdown a node
+        // being removed.
+        self.membership = cfg;
+        if !self.membership.contains(&self.id) {
+            self.set_target_state(State::NonVoter);
+        } else if self.target_state == State::NonVoter && self.membership.members.contains(&self.id)
+        {
+            // The node is a NonVoter and the new config has it configured as a normal member.
+            // Transition to follower.
+            self.set_target_state(State::Follower);
+        }
+        Ok(())
+    }
+}
+
+/// An enum describing the way the current leader property is to be updated.
+#[derive(Debug)]
+pub(self) enum UpdateCurrentLeader {
+    Unknown,
+    OtherNode(NodeId),
+    ThisNode,
 }
 
 /// The current snapshot state of the Barasona node.
@@ -309,3 +430,57 @@ impl State {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Volatile state specific to the Barasona leader.
+struct LeaderState<
+    'a,
+    D: AppData,
+    R: AppDataResponse,
+    N: BarasonaNetwork<D>,
+    S: BarasonaStorage<D, R>,
+> {
+    pub(super) core: &'a mut BarasonaCore<D, R, N, S>,
+    /// A mapping of node IDs the replication state of the target node.
+    pub(super) nodes: BTreeMap<NodeId, ReplicationState<D>>,
+    /// A mapping of new nodes (non-voters) which are being synced in order to join the cluster.
+    pub(super) non_voters: BTreeMap<NodeId, NonVoterReplicationState<D>>,
+    /// A bool indicating if this node will be stepping down after committing the current config change.
+    pub(super) is_stepping_down: bool,
+
+    /// The stream of events coming from replication streams.
+    pub(super) replication_rx: mpsc::UnboundedReceiver<ReplicaEvent<S::Snapshot>>,
+    /// The clonable sender channel for replication stream events.
+    pub(super) replication_tx: mpsc::UnboundedSender<ReplicaEvent<S::Snapshot>>,
+    /// A buffer of client requests which have been appended locally and are awaiting to be committed to the cluster.
+    pub(super) awaiting_committed: Vec<ClientRequestEntry<D, R>>,
+    /// A field tracking the cluster's current consensus state, which is used for dynamic membership.
+    pub(super) consensus_state: ConsensusState,
+
+    /// An optional response channel for when a config change has been proposed, and is awaiting a response.
+    pub(super) propose_config_change_cb: Option<oneshot::Sender<Result<(), BarasonaError>>>,
+    /// An optional receiver for when a joint consensus config is committed.
+    pub(super) joint_consensus_cb: FuturesOrdered<oneshot::Receiver<Result<u64, BarasonaError>>>,
+    /// An optional receiver for when a uniform consensus config is committed.
+    pub(super) uniform_consensus_cb: FuturesOrdered<oneshot::Receiver<Result<u64, BarasonaError>>>,
+}
+
+/// A struct tracking the state of a replication stream from the perspective of the Barasona actor.
+struct ReplicationState<D: AppData> {
+    pub match_index: u64,
+    pub match_term: u64,
+    pub is_at_line_rate: bool,
+    pub remove_after_commit: Option<u64>,
+    pub replication_stream: ReplicationStream<D>,
+}
+
+/// The same as `ReplicationState`, except for non-voters.
+struct NonVoterReplicationState<D: AppData> {
+    /// The replication stream state.
+    pub state: ReplicationState<D>,
+    /// A bool indicating if this non-voters is ready to join the cluster.
+    pub is_ready_to_join: bool,
+    /// The response channel to use for when this node has successfully synced with the cluster.
+    pub tx: Option<oneshot::Sender<Result<(), ChangeConfigError>>>,
+}
+
+// TODO Ricardo continue here

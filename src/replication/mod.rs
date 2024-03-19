@@ -521,7 +521,7 @@ where
         /// The term of the most recent log known to have been successfully replicated on the target.
         match_term: u64,
     },
-    /// An event indicating that the Baarasona node needs to revert to follower state.
+    /// An event indicating that the Barasona node needs to revert to follower state.
     RevertToFollower {
         /// The ID of the target node from which the new term was observed.
         target: NodeId,
