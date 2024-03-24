@@ -484,3 +484,35 @@ struct NonVoterReplicationState<D: AppData> {
 }
 
 // TODO Ricardo continue here
+
+struct CandidateState<
+    'a,
+    D: AppData,
+    R: AppDataResponse,
+    N: BarasonaNetwork<D>,
+    S: BarasonaStorage<D, R>,
+> {
+    core: &'a mut BarasonaCore<D, R, N, S>,
+    /// The number of votes which have been granted by peer nodes of the old (current) config group.
+    votes_granted_old: u64,
+    /// The number of votes needed from the old (current) config group in order to become the Barasona leader.
+    votes_needed_old: u64,
+    /// The number of votes which have been granted by peer nodes of the new config group (if applicable).
+    votes_granted_new: u64,
+    /// The number of votes needed from the new config group in order to become the Barasona leader (if applicable).
+    votes_needed_new: u64,
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    CandidateState<'a, D, R, N, S>
+{
+    pub(self) fn new(core: &'a mut BarasonaCore<D, R, N, S>) -> Self {
+        Self {
+            core,
+            votes_granted_old: 0,
+            votes_needed_old: 0,
+            votes_granted_new: 0,
+            votes_needed_new: 0,
+        }
+    }
+}

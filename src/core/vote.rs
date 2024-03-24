@@ -1,8 +1,11 @@
+use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use crate::barasona::{VoteRequest, VoteResponse};
-use crate::core::{BarasonaCore, State};
+use crate::core::{BarasonaCore, CandidateState, State, UpdateCurrentLeader};
 use crate::error::BarasonaResult;
+use crate::NodeId;
 use crate::{network::BarasonaNetwork, storage::BarasonaStorage, AppData, AppDataResponse};
 
 impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
@@ -93,5 +96,93 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
                 })
             }
         }
+    }
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    CandidateState<'a, D, R, N, S>
+{
+    #[tracing::instrument(level = "trace", skip(self, res, target))]
+    pub(super) async fn handle_vote_response(
+        &mut self,
+        res: VoteResponse,
+        target: NodeId,
+    ) -> BarasonaResult<()> {
+        // If peer's term is greater than current term, revert to follower state.
+        if self.core.current_term < res.term {
+            self.core.update_current_term(res.term, None);
+            self.core
+                .update_current_leader(UpdateCurrentLeader::Unknown);
+            self.core.set_target_state(State::Follower);
+            self.core.save_hard_state().await?;
+            tracing::trace!("reverting to follower state due to greater term observed in RequestVote RPC response");
+            return Ok(());
+        }
+
+        // If peer granted vode, then update campaign state
+        if res.vote_granted {
+            // Handle vote responses from the C0 config group
+            if self.core.membership.members.contains(&target) {
+                self.votes_granted_old += 1;
+            }
+
+            // Handle vote responses from the C1 config group
+            if self
+                .core
+                .membership
+                .members_after_consensus
+                .as_ref()
+                .map(|members| members.contains(&target))
+                .unwrap_or(false)
+            {
+                self.votes_granted_new += 1;
+            }
+
+            // If we've received enough votes from both config groups, then transition to leader state`.
+            if self.votes_granted_old >= self.votes_needed_old
+                && self.votes_granted_new >= self.votes_needed_new
+            {
+                tracing::trace!("Transitioning to leader state as the minimum number of votes have been granted");
+                self.core.set_target_state(State::Leader);
+                return Ok(());
+            }
+        }
+
+        // Otherwise, we just return and let the candidate loop wait for more votes to come in.
+        Ok(())
+    }
+
+    /// Spawn pararell vote requests to all cluster members
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub(super) fn spawn_parallel_vote_requests(&self) -> mpsc::Receiver<(VoteResponse, NodeId)> {
+        let all_members = self.core.membership.all_nodes();
+        let (tx, rx) = mpsc::channel(all_members.len());
+        for member in all_members
+            .into_iter()
+            .filter(|member| member != &self.core.id)
+        {
+            let rpc = VoteRequest {
+                term: self.core.current_term,
+                candidate_id: self.core.id,
+                last_log_index: self.core.last_log_index,
+                last_log_term: self.core.last_log_term,
+            };
+
+            let (network, tx_inner) = (self.core.network.clone(), tx.clone());
+            let _ = tokio::spawn(
+                async move {
+                    match network.vote(member, rpc).await {
+                        Ok(res) => {
+                            let _ = tx_inner.send((res, member)).await;
+                        }
+                        Err(err) => {
+                            tracing::error!({error=%err, peer=member}, "error while requesting vote from peer")
+                        }
+                    }
+                }
+                .instrument(tracing::trace_span!("requesting vote from peer", target = member)),
+            );
+        }
+        rx
     }
 }

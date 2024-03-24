@@ -172,6 +172,15 @@ pub struct MembershipConfig {
 }
 
 impl MembershipConfig {
+    /// Returns an iterator over all nodes in the current config
+    pub fn all_nodes(&self) -> HashSet<NodeId> {
+        let mut all = self.members.clone();
+        if let Some(members) = &self.members_after_consensus {
+            all.extend(members);
+        }
+        all
+    }
+
     /// Check if the given NodeId exists in this membership config.
     ///
     /// When in joint consensus, this will check both config groups.
@@ -182,6 +191,11 @@ impl MembershipConfig {
             } else {
                 false
             }
+    }
+
+    /// Check to see if the config is currently in joint consensus.
+    pub fn is_in_joint_consensus(&self) -> bool {
+        self.members_after_consensus.is_some()
     }
 
     /// Create a new initial config containing only the given node ID.
