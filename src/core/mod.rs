@@ -3,7 +3,11 @@
 mod client;
 mod vote;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::stream::{AbortHandle, FuturesOrdered};
 use serde::{Deserialize, Serialize};
@@ -14,8 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    barasona::Entry,
-    barasona::{BarasonaMsg, MembershipConfig},
+    barasona::{BarasonaMsg, ChangeMembershipTx, Entry, MembershipConfig},
     config::BarasonaConfig,
     error::{BarasonaError, BarasonaResult, ChangeConfigError},
     metrics::BarasonaMetrics,
@@ -483,8 +486,48 @@ struct NonVoterReplicationState<D: AppData> {
     pub tx: Option<oneshot::Sender<Result<(), ChangeConfigError>>>,
 }
 
-// TODO Ricardo continue here
+/// A state enum used by Barasona leaders to navigate the joint consensus protocol.
+pub enum ConsensusState {
+    /// The cluster is preparing to go into joint consensus, but the leader is still syncing
+    /// some non-voters to prepare them for cluster membership.
+    NonVoterSync {
+        /// The set of non-voters nodes which are still being synced.
+        awaiting: HashSet<NodeId>,
+        /// The full membership change which has been proposed.
+        members: HashSet<NodeId>,
+        /// The response channel to use once the consensus state is back into uniform state.
+        tx: ChangeMembershipTx,
+    },
+    /// The cluster is in a joint consensus state and is syncing new nodes.
+    Joint {
+        /// A bool indicating if the associated config which started this joint consensus has yet been comitted.
+        ///
+        /// NOTE: when a new leader is elected, it will initialize this value to false, and then
+        /// update this value to true once the new leader's blank payload has been committed.
+        is_commited: bool,
+    },
+    /// The cluster consensus is uniform; not in a joint consensus state.
+    Uniform,
+}
 
+impl ConsensusState {
+    /// Check the current state to determine if it is in joint consensus, and if it is safe to finalize the joint consensus.
+    ///
+    /// The return value will be true if:
+    /// 1. this object currently represents a joint consensus state.
+    /// 2. the corresponding config for this consensus state has been committed to the cluster.
+    pub fn is_joint_consensus_safe_to_finalize(&self) -> bool {
+        match self {
+            ConsensusState::Joint { is_commited } => *is_commited,
+            _ => false,
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Volatile state specific to a Barasona node in candidate state.
 struct CandidateState<
     'a,
     D: AppData,
