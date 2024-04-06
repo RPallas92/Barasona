@@ -1,6 +1,7 @@
 //! The core logic of a Barasona node.
 
 mod client;
+mod install_snapshot;
 mod vote;
 
 use std::{
