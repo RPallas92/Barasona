@@ -75,15 +75,15 @@ The cluster leader handles all client requests and client requests must be redir
 - It must send periodic heartbeats (empty AppendEntries RPCs) to all followers in order to maintain their authority and prevent new elections.
 
 - It must service client requests. Each client request contains a command to be executed by the replicated state machines:
-  - The leader applies the client request to the state machine
   - The leader appends the command to its log as a new entry.
+  - The leader applies the client request to the state machine
   - Then issues AppendEntries RPCs in parallel to each of the other servers to replicate the entry.
   - At the same time it returns the result of that execution to the client, without waiting for followers to reply.
   - Once followers reply, the leader mark the entry as commited.
   - Notice that an uncommited entry could be lost even the leader has alredy replied to the client. This is a tradeoff betweeen performance and data durability. Every time a client requests to read data from the state machine, the leader will also inform whether it is commited or not.
 - If followers crash or run slowly, or if network packets are lost, the leader retries AppendEntries RPCs indefinitely until all followers eventually store all log entries; AppendEntries RPCs should be issued in parallel for best performance; AppendEntries RPCs are idempotent.
 - A leader never overwrites or deletes entries in its own log.
-- If leader becomes follower, it fallbacks to previous snapshot if any, otherwise resets the state machine. This is done to ensure its state machine does not have any uncommited entry applied.
+- If the leader becomes a follower, it falls back to the previous snapshot, if available, or deletes all entries from the last committed entry up to the last entry (the last committed entry is not included). Otherwise, it resets the state machine. This is done to ensure its state machine does not have any uncommited entry applied.
 
 #### Replication
 - A leader creates at most one entry with a given log index in a given term, and log entries never change their position in the log.
@@ -97,9 +97,10 @@ The cluster leader handles all client requests and client requests must be redir
 
 ##### Receiver implementation: AppendEntries RPC
 1. Reply false if term < currentTerm.
+1. Update commitIndex from message received from leader.
 1. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm. Include last commited term and index in the response.
 1. If an existing entry conflicts with a new one (same index but different terms), reset state machine to previous snapshot.
-1. Commit all new entries after applying it to the state machine.
+1. Apply entries to log. Mext, same entries applied to log must be also applied to the state machine.
 1. If leaderCommit > commitIndex, set commitIndex to min(leaderCommit, index of last new entry).
 
 ## Configuration changes
@@ -148,3 +149,51 @@ Clients of Barasona send all of their requests to the leader.
 - When a client first starts up, it connects to a randomly-chosen server. 
 - If the client's first choice is not the leader, that server will reject the client's request and supply information about the most recent leader it has heard from.
 - If the leader crashes, client requests will timeout; clients then try again with randomly-chosen servers.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+FIRST APPLY TO state machine (leader and follower) without checking if it is commited or not. Then append to log. 
+Committed when majority answers. Followers update their commit index when leader sends append entries (including heartbeat).
+
+I am thinking that maybe state machine is not even needed. Log and state machine should be the same. Append to log. Then mark as commited when required. 
+
+Raft says we should not block when applying to state machine. Same for applying to log in Barasona as we are merging both log and state machine.
+
+I am thinking if Barasona should append to log in a separate tokio thread, or is the storage implementation the one that ensures it is not blocking?
+
+
+
+To simplify I would leave that responsibility to the storage implementation. Barasona should assume that is not blocking.
+
+
+RAFT. asked chat GPT:
+
+```
+The purpose of having both initial_replicate_to_state_machine and replicate_to_state_machine_if_needed methods is to handle different scenarios efficiently within the Raft consensus algorithm implementation.
+
+    initial_replicate_to_state_machine:
+        This method is responsible for performing the initial replication of outstanding log entries to the state machine.
+        It is intended to be executed only once and only in response to the first payload of entries received from the AppendEntries RPC handler.
+        This initial replication ensures that the state machine is synchronized with the leader's log when a node transitions from a follower to a leader or when it joins the cluster.
+
+    replicate_to_state_machine_if_needed:
+        This method is responsible for replicating any outstanding log entries to the state machine when needed.
+        It optimistically updates the last_applied index and replicates entries to the state machine asynchronously.
+        It is called whenever there are new entries to be applied to the state machine after the initial replication.
+        It avoids unnecessary replication if there are no new entries or if there is an active replication task already in progress.
+
+By having separate methods for initial replication and subsequent replication, the Raft implementation can handle different scenarios efficiently. The initial_replicate_to_state_machine method ensures that the state machine is initialized correctly, while replicate_to_state_machine_if_needed handles ongoing replication asynchronously and optimistically updates the state without blocking the main control loop.
+```

@@ -1,5 +1,6 @@
 //! The core logic of a Barasona node.
 
+mod append_entries;
 mod client;
 mod install_snapshot;
 mod vote;
@@ -201,8 +202,7 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
 
         // If this is the only configured member and there is live state, then this is
         // a single-node cluster. Become leader.
-        // TODO Ricardo why min_value if last log index should be 0 if the first one, right?
-        if is_only_configured_member && self.last_log_index != u64::min_value() {
+        if is_only_configured_member && self.last_log_index != u64::MIN {
             self.target_state = State::Leader;
         }
         // Else if there are other members, that can only mean that state was recovered. Become follower.

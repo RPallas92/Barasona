@@ -75,13 +75,13 @@ struct ReplicationCore<
     term: u64,
     /// A channel for sending events to the Barasona node.
     barasona_tx: mpsc::UnboundedSender<ReplicaEvent<S::Snapshot>>,
-    /// A channel for receiving events from the Raft node.
+    /// A channel for receiving events from the Barasona node.
     barasona_rx: mpsc::UnboundedReceiver<BarasonaEvent<D>>,
     /// The `BarasonaNetwork` interface.
     network: Arc<N>,
     /// The `BarasonaStorage` interface.
     storage: Arc<S>,
-    /// The Raft's runtime config.
+    /// The Barasona's runtime config.
     config: Arc<BarasonaConfig>,
     /// The configured max payload entries, simply as a usize.
     max_payload_entries: usize,

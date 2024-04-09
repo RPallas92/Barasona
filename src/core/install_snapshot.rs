@@ -58,7 +58,7 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         // Compare current snapshot state with received RPC and handle as needed.
         match self.snapshot_state.take() {
             None => Ok(self.begin_installing_snapshot(req).await?),
-            Some(SnapshotState::Snapshotting { handle, sender }) => {
+            Some(SnapshotState::Snapshotting { handle, .. }) => {
                 handle.abort(); // Abort the current compaction in favor of installation from leader.
                 Ok(self.begin_installing_snapshot(req).await?)
             }
@@ -161,7 +161,7 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
 
     /// Finalize the installation of a new snapshot.
     ///
-    /// Any errors which come up from this routine will cause the Raft node to go into shutdown.
+    /// Any errors which come up from this routine will cause the Barasona node to go into shutdown.
     #[tracing::instrument(level = "trace", skip(self, req, snapshot))]
     async fn finalize_snapshot_installation(
         &mut self,
