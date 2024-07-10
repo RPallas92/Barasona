@@ -29,7 +29,7 @@ use crate::{
     metrics::BarasonaMetrics,
     network::BarasonaNetwork,
     replication::{ReplicaEvent, ReplicationStream},
-    storage::{self, BarasonaStorage, PersistentState},
+    storage::{BarasonaStorage, PersistentState},
     AppData, AppDataResponse, NodeId,
 };
 
@@ -117,7 +117,7 @@ where
     /// An unbounded receiver channel for receiving Barasona messages from the external API.
     /// Used for communication with the external world, receiving commands or queries that
     /// need to be processed by the Barasona node.
-    rx_api: mpsc::UnboundedReceiver<BarasonaMsg<D, R>>,
+    rx_api: mpsc::UnboundedReceiver<BarasonaMsg<D>>,
     /// sender channel for reporting Barasona metrics. Used to send metrics data, such as the current state,
     /// term, leader, etc., to an external entity that may be monitoring or tracking the Barasona node's performance
     tx_metrics: watch::Sender<BarasonaMetrics>,

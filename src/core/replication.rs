@@ -60,11 +60,14 @@ impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStora
                 self.handle_update_match_index(target, match_index, match_term)
                     .await
             }
-            _ => {
-                return; // TODO Ricardo implement all other cases.
+            ReplicaEvent::NeedsSnapshot { target, tx } => {
+                self.handle_needs_snapshot(target, tx).await
+            }
+            ReplicaEvent::Shutdown => {
+                self.core.set_target_state(State::Shutdown);
+                return;
             }
         };
-
         if let Err(err) = res {
             tracing::error!({error=%err}, "error while processing event from replication stream");
         }
