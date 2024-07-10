@@ -7,16 +7,16 @@ use tokio::sync::oneshot;
 
 use crate::{
     error::{BarasonaError, ChangeConfigError, ClientReadError, ClientWriteError, InitializeError},
-    AppData, AppDataResponse, NodeId,
+    AppData, NodeId,
 };
 
-pub(crate) type ClientWriteResponseTx<D, R> =
-    oneshot::Sender<Result<ClientWriteResponse<R>, ClientWriteError<D>>>;
+pub(crate) type ClientWriteResponseTx<D> =
+    oneshot::Sender<Result<ClientWriteResponse, ClientWriteError<D>>>;
 pub(crate) type ClientReadResponseTx = oneshot::Sender<Result<(), ClientReadError>>;
 pub(crate) type ChangeMembershipTx = oneshot::Sender<Result<(), ChangeConfigError>>;
 
 /// A message coming from the Barasona API.
-pub(crate) enum BarasonaMsg<D: AppData, R: AppDataResponse> {
+pub(crate) enum BarasonaMsg<D: AppData> {
     AppendEntries {
         rpc: AppendEntriesRequest<D>,
         tx: oneshot::Sender<Result<AppendEntriesResponse, BarasonaError>>,
@@ -31,7 +31,7 @@ pub(crate) enum BarasonaMsg<D: AppData, R: AppDataResponse> {
     },
     ClientWriteRequest {
         rpc: ClientWriteRequest<D>,
-        tx: ClientWriteResponseTx<D, R>,
+        tx: ClientWriteResponseTx<D>,
     },
     ClientReadRequest {
         tx: ClientReadResponseTx,
@@ -303,10 +303,11 @@ impl<D: AppData> ClientWriteRequest<D> {
 
 /// The response to a `ClientRequest`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClientWriteResponse<R: AppDataResponse> {
+pub struct ClientWriteResponse {
     /// The log index of the successfully processed client request.
     pub index: u64,
-    /// Application specific response data.
-    #[serde(bound = "R: AppDataResponse")]
-    pub data: R,
+    // TODO Ricardo I deleted this for now because this is the response after applying it to the state machine (after commit).
+    // Application specific response data.
+    // #[serde(bound = "R: AppDataResponse")]
+    // pub data: R,
 }

@@ -1,8 +1,10 @@
 //! The core logic of a Barasona node.
 
+mod admin;
 mod append_entries;
 mod client;
 mod install_snapshot;
+mod replication;
 mod vote;
 
 use std::{
@@ -11,22 +13,23 @@ use std::{
     time::Duration,
 };
 
-use futures::stream::{AbortHandle, FuturesOrdered};
+use futures::stream::{AbortHandle, Abortable, FuturesOrdered};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::Instant,
 };
+use tracing::Instrument;
 
 use crate::{
     barasona::{BarasonaMsg, ChangeMembershipTx, Entry, MembershipConfig},
-    config::BarasonaConfig,
+    config::{BarasonaConfig, SnapshotPolicy},
     error::{BarasonaError, BarasonaResult, ChangeConfigError},
     metrics::BarasonaMetrics,
     network::BarasonaNetwork,
     replication::{ReplicaEvent, ReplicationStream},
-    storage::{BarasonaStorage, PersistentState},
+    storage::{self, BarasonaStorage, PersistentState},
     AppData, AppDataResponse, NodeId,
 };
 
@@ -353,6 +356,64 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         }
         Ok(())
     }
+
+    /// Trigger a log compaction (snapshot) job if needed.
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub(self) fn trigger_log_compaction_if_needed(&mut self) {
+        if self.snapshot_state.is_some() {
+            return;
+        }
+
+        let SnapshotPolicy::LogsSinceLast(threshold) = self.config.snapshot_policy;
+
+        if self.commit_index <= self.snapshot_index {
+            return;
+        }
+
+        let is_below_threshold = self
+            .commit_index
+            .checked_sub(self.snapshot_index)
+            .map(|diff| diff < threshold)
+            .unwrap_or(false);
+
+        if is_below_threshold {
+            return;
+        }
+
+        // At this point, we are clear to begin a new compaction process.
+        let storage = self.storage.clone();
+        let (handle, reg) = AbortHandle::new_pair();
+        let (chan_tx, _) = broadcast::channel(1);
+        let tx_compaction = self.tx_compaction.clone();
+        self.snapshot_state = Some(SnapshotState::Snapshotting {
+            handle,
+            sender: chan_tx.clone(),
+        });
+        tokio::spawn(
+            async move {
+                let res = Abortable::new(storage.do_log_compaction(), reg).await;
+                match res {
+                    Ok(res) => match res {
+                        Ok(snapshot) => {
+                            let _ = tx_compaction
+                                .try_send(SnapshotUpdate::SnapshotComplete(snapshot.index));
+                            let _ = chan_tx.send(snapshot.index); // This will always succeed.
+                        }
+                        Err(err) => {
+                            tracing::error!({error=%err}, "error while generating snapshot");
+                            let _ = tx_compaction.try_send(SnapshotUpdate::SnapshotFailed);
+                        }
+                    },
+                    Err(_aborted) => {
+                        let _ = tx_compaction.try_send(SnapshotUpdate::SnapshotFailed);
+                    }
+                }
+            }
+            .instrument(tracing::debug_span!(
+                "starting a new log compaction process."
+            )),
+        );
+    }
 }
 
 /// An enum describing the way the current leader property is to be updated.
@@ -505,7 +566,7 @@ pub enum ConsensusState {
         ///
         /// NOTE: when a new leader is elected, it will initialize this value to false, and then
         /// update this value to true once the new leader's blank payload has been committed.
-        is_commited: bool,
+        is_committed: bool,
     },
     /// The cluster consensus is uniform; not in a joint consensus state.
     Uniform,
@@ -519,7 +580,7 @@ impl ConsensusState {
     /// 2. the corresponding config for this consensus state has been committed to the cluster.
     pub fn is_joint_consensus_safe_to_finalize(&self) -> bool {
         match self {
-            ConsensusState::Joint { is_commited } => *is_commited,
+            ConsensusState::Joint { is_committed } => *is_committed,
             _ => false,
         }
     }
@@ -558,5 +619,27 @@ impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStora
             votes_granted_new: 0,
             votes_needed_new: 0,
         }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Volatile state specific to a Barasona node in non-voter state.
+pub struct NonVoterState<
+    'a,
+    D: AppData,
+    R: AppDataResponse,
+    N: BarasonaNetwork<D>,
+    S: BarasonaStorage<D, R>,
+> {
+    core: &'a mut BarasonaCore<D, R, N, S>,
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    NonVoterState<'a, D, R, N, S>
+{
+    pub(self) fn new(core: &'a mut BarasonaCore<D, R, N, S>) -> Self {
+        Self { core }
     }
 }
