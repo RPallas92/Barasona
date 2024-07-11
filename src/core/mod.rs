@@ -28,7 +28,7 @@ use crate::{
     error::{BarasonaError, BarasonaResult, ChangeConfigError},
     metrics::BarasonaMetrics,
     network::BarasonaNetwork,
-    replication::{ReplicaEvent, ReplicationStream},
+    replication::{BarasonaEvent, ReplicaEvent, ReplicationStream},
     storage::{BarasonaStorage, PersistentState},
     AppData, AppDataResponse, NodeId,
 };
@@ -95,6 +95,7 @@ where
     /// the current cluster leader.
     ///
     /// Whenever there is a leadership change, this cache will be cleared.
+    /// // TODO Ricardo do we need this?
     entries_cache: BTreeMap<u64, Entry<D>>,
     /// The stream of join handles from state machine replication tasks. There will only ever be
     /// a maximum of 1 element at a time.
@@ -134,7 +135,7 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         config: Arc<BarasonaConfig>,
         network: Arc<N>,
         storage: Arc<S>,
-        rx_api: mpsc::UnboundedReceiver<BarasonaMsg<D, R>>,
+        rx_api: mpsc::UnboundedReceiver<BarasonaMsg<D>>,
         tx_metrics: watch::Sender<BarasonaMetrics>,
         rx_shutdown: oneshot::Receiver<()>,
     ) -> JoinHandle<BarasonaResult<()>> {
@@ -210,7 +211,7 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         }
         // Else if there are other members, that can only mean that state was recovered. Become follower.
         // Here we use a 30 second overhead on the initial next_election_timeout. This is because we need
-        // to ensure that restarted nodes don't disrupt a stable cluster by timing out and driving up their
+        // to ensure that restarted nodes don't disrupt a stable cluster by timing out and incremeting their
         // term before network communication is established.
         else if !is_only_configured_member && self.membership.contains(&self.id) {
             self.target_state = State::Follower;
@@ -224,10 +225,24 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
             self.target_state = State::NonVoter;
         }
 
-        // TODO Ricardo continue here
-        // TODO Ricardo I first need to implement the replication module as it is called by this module
+        // This is central loop of the system. The Barasona core assumes a few different roles based
+        // on cluster state. The Barasona core will delegate control to the different state
+        // controllers and simply awaits the delegated loop to return, which will only take place
+        // if some error has been encountered, or if a state change is required.
+        loop {
+            match self.target_state {
+                State::Leader => todo!("implement LeaderState::new"),
+                State::Candidate => todo!(),
+                State::Follower => todo!(),
+                State::NonVoter => todo!(),
+                State::Shutdown => {
+                    tracing::info!("Node has shutdown");
+                    return Ok(());
+                }
+            }
+        }
 
-        loop {}
+        // TODO Ricardo continue here
     }
 
     /// Report a metrics payload on the current state of the Barasona node.
@@ -517,7 +532,7 @@ struct LeaderState<
     /// The clonable sender channel for replication stream events.
     pub(super) replication_tx: mpsc::UnboundedSender<ReplicaEvent<S::Snapshot>>,
     /// A buffer of client requests which have been appended locally and are awaiting to be committed to the cluster.
-    pub(super) awaiting_committed: Vec<ClientRequestEntry<D, R>>,
+    pub(super) awaiting_committed: Vec<ClientRequestEntry<D>>,
     /// A field tracking the cluster's current consensus state, which is used for dynamic membership.
     pub(super) consensus_state: ConsensusState,
 
@@ -527,6 +542,104 @@ struct LeaderState<
     pub(super) joint_consensus_cb: FuturesOrdered<oneshot::Receiver<Result<u64, BarasonaError>>>,
     /// An optional receiver for when a uniform consensus config is committed.
     pub(super) uniform_consensus_cb: FuturesOrdered<oneshot::Receiver<Result<u64, BarasonaError>>>,
+}
+
+impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D, R>>
+    LeaderState<'a, D, R, N, S>
+{
+    // Create a new instance
+    pub(self) fn new(core: &'a mut BarasonaCore<D, R, N, S>) -> Self {
+        let consensus_state = if core.membership.is_in_joint_consensus() {
+            ConsensusState::Joint {
+                is_committed: false,
+            }
+        } else {
+            ConsensusState::Uniform
+        };
+
+        let (replication_tx, replication_rx) = mpsc::unbounded_channel();
+        Self {
+            core,
+            nodes: BTreeMap::new(),
+            non_voters: BTreeMap::new(),
+            is_stepping_down: false,
+            replication_rx,
+            replication_tx,
+            awaiting_committed: Vec::new(),
+            consensus_state,
+            propose_config_change_cb: None,
+            joint_consensus_cb: FuturesOrdered::new(),
+            uniform_consensus_cb: FuturesOrdered::new(),
+        }
+    }
+
+    // Transition to the Barasona leader state.
+    #[tracing::instrument(level="trace", skip(self), fields(id=self.core.id, barasona_state="leader"))]
+    pub(self) async fn run(mut self) -> BarasonaResult<()> {
+        // Spawn replication streams.
+        let targets = self
+            .core
+            .membership
+            .all_nodes()
+            .into_iter()
+            .filter(|node_id| node_id != &self.core.id)
+            .collect::<Vec<_>>();
+
+        for target in targets {
+            let state = self.spawn_replication_stream(target);
+            self.nodes.insert(target, state);
+        }
+
+        // Setup state as leader.
+        self.core.last_heartbeat = None;
+        self.core.next_election_timeout = None;
+        self.core
+            .update_current_leader(UpdateCurrentLeader::ThisNode);
+        self.core.report_metrics();
+
+        // Commit an initial entry as part of becoming the cluster leader.
+        self.commit_initial_leader_entry().await?;
+
+        loop {
+            // Check if not leader and terminate all replstreams
+            if !self.core.target_state.is_leader() {
+                for node in self.nodes.values() {
+                    let _ = node
+                        .replication_stream
+                        .repl_tx
+                        .send(BarasonaEvent::Terminate);
+                }
+                for node in self.non_voters.values() {
+                    let _ = node
+                        .state
+                        .replication_stream
+                        .repl_tx
+                        .send(BarasonaEvent::Terminate);
+                }
+                return Ok(());
+            }
+
+            // tokio select recv message
+            tokio::select! {
+                Some(msg) = self.core.rx_api.recv() => match msg {
+                    BarasonaMsg::AppendEntries{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_append_entries_request(rpc).await);
+                    },
+                    BarasonaMsg::RequestVote {rpc, tx} => {
+                        let _ = tx.send(self.core.handle_vote_request(rpc).await);
+                    },
+                    BarasonaMsg::InstallSnapshot{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_install_snapshot_request(rpc).await);
+                    },
+                    BarasonaMsg::ClientReadRequest{tx} => {
+                        self.handle_client_read_request(tx).await;
+                    }
+                    _ => {}, // TODO Ricardo continue here
+
+                }
+            }
+        }
+    }
 }
 
 /// A struct tracking the state of a replication stream from the perspective of the Barasona actor.
