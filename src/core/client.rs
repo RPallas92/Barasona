@@ -10,7 +10,7 @@ use crate::{
         ClientWriteResponseTx, Entry, EntryPayload,
     },
     core::{LeaderState, State},
-    error::{BarasonaError, BarasonaResult, ClientReadError},
+    error::{BarasonaError, BarasonaResult, ClientReadError, ClientWriteError},
     network::BarasonaNetwork,
     replication::BarasonaEvent,
     storage::BarasonaStorage,
@@ -236,6 +236,24 @@ impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStora
                 "too many requests failed, could not confirm leadership"
             )),
         )));
+    }
+
+    /// Handle client write requests.
+    #[tracing::instrument(level = "trace", skip(self, rpc, tx))]
+    pub(super) async fn handle_client_write_request(
+        &mut self,
+        rpc: ClientWriteRequest<D>,
+        tx: ClientWriteResponseTx<D>,
+    ) {
+        let entry = match self.append_payload_to_log(rpc.entry).await {
+            Ok(entry) => ClientRequestEntry::from_entry(entry, tx),
+            Err(err) => {
+                let _ = tx.send(Err(ClientWriteError::BarasonaError(err)));
+                return;
+            }
+        };
+
+        self.replicate_client_request(entry).await;
     }
 
     /// Transform the given payload into an entry, assign an index and term, and append the entry to the log.

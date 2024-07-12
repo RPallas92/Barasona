@@ -13,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use futures::stream::{AbortHandle, Abortable, FuturesOrdered};
+use futures::{
+    stream::{AbortHandle, Abortable, FuturesOrdered},
+    StreamExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
@@ -25,7 +28,7 @@ use tracing::Instrument;
 use crate::{
     barasona::{BarasonaMsg, ChangeMembershipTx, Entry, MembershipConfig},
     config::{BarasonaConfig, SnapshotPolicy},
-    error::{BarasonaError, BarasonaResult, ChangeConfigError},
+    error::{BarasonaError, BarasonaResult, ChangeConfigError, InitializeError},
     metrics::BarasonaMetrics,
     network::BarasonaNetwork,
     replication::{BarasonaEvent, ReplicaEvent, ReplicationStream},
@@ -103,7 +106,7 @@ where
     /// This abstraction is needed to ensure that replicating to the state machine does not block
     /// the AppendEntries RPC flow, and to ensure that we have a smooth transition to becoming
     /// leader without concern over duplicate application of entries to the state machine.
-    replicate_to_sm_handle: FuturesOrdered<JoinHandle<anyhow::Result<Option<u64>>>>,
+    replicate_to_sm_handle: FuturesOrdered<JoinHandle<anyhow::Result<Option<u64>>>>, // TODO Ricardo we don't need this
     /// A bool indicating if this system has performed its initial replication of
     /// outstanding entries to the state machine.
     has_completed_initial_replication_to_sm: bool,
@@ -231,8 +234,8 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         // if some error has been encountered, or if a state change is required.
         loop {
             match self.target_state {
-                State::Leader => todo!("implement LeaderState::new"),
-                State::Candidate => todo!(),
+                State::Leader => LeaderState::new(&mut self).run().await?,
+                State::Candidate => todo!("TODO Ricardo implement CandidateState::new"),
                 State::Follower => todo!(),
                 State::NonVoter => todo!(),
                 State::Shutdown => {
@@ -372,6 +375,18 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
         Ok(())
     }
 
+    /// Update the system's snapshot state based on the given data.
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub(self) fn update_snapshot_state(&mut self, update: SnapshotUpdate) {
+        if let SnapshotUpdate::SnapshotComplete(index) = update {
+            self.snapshot_index = index;
+        }
+        // If snapshot state is anything other than streaming, then drop it.
+        if let Some(state @ SnapshotState::Streaming { .. }) = self.snapshot_state.take() {
+            self.snapshot_state = Some(state)
+        }
+    }
+
     /// Trigger a log compaction (snapshot) job if needed.
     #[tracing::instrument(level = "trace", skip(self))]
     pub(self) fn trigger_log_compaction_if_needed(&mut self) {
@@ -428,6 +443,12 @@ impl<D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStorage<D
                 "starting a new log compaction process."
             )),
         );
+    }
+
+    /// Reject an init config request due to the Barasona node being in a state which prohibits the request.
+    #[tracing::instrument(level = "trace", skip(self, tx))]
+    fn reject_init_with_config(&self, tx: oneshot::Sender<Result<(), InitializeError>>) {
+        let _ = tx.send(Err(InitializeError::NotAllowed));
     }
 }
 
@@ -633,10 +654,44 @@ impl<'a, D: AppData, R: AppDataResponse, N: BarasonaNetwork<D>, S: BarasonaStora
                     },
                     BarasonaMsg::ClientReadRequest{tx} => {
                         self.handle_client_read_request(tx).await;
+                    },
+                    BarasonaMsg::ClientWriteRequest{rpc, tx} => {
+                         self.handle_client_write_request(rpc, tx).await;
+                    },
+                    BarasonaMsg::Initialize{tx, ..} => {
+                        self.core.reject_init_with_config(tx);
+                    },
+                    BarasonaMsg::AddNonVoter{id, tx} => {
+                        self.add_member(id, tx);
+                    },
+                    BarasonaMsg::ChangeMembership{members, tx} => {
+                        self.change_membership(members, tx).await;
+                    },
+                },
+                Some(update) = self.core.rx_compaction.recv() => self.core.update_snapshot_state(update),
+                Some(Ok(res)) = self.joint_consensus_cb.next() => {
+                    match res {
+                        Ok(_) => self.handle_joint_consensus_committed().await?,
+                        Err(err) => if let Some(cb) = self.propose_config_change_cb.take() {
+                            let _ = cb.send(Err(err));
+                        },
                     }
-                    _ => {}, // TODO Ricardo continue here
-
-                }
+                },
+                Some(Ok(res)) = self.uniform_consensus_cb.next() => {
+                    match res {
+                        Ok(index) => {
+                            let final_res = self.handle_uniform_consensus_committed(index).await;
+                            if let Some(cb) = self.propose_config_change_cb.take() {
+                                let _ = cb.send(final_res);
+                            }
+                        },
+                        Err(err) => if let Some(cb) = self.propose_config_change_cb.take() {
+                            let _ = cb.send(Err(err));
+                        }
+                    }
+                },
+                Some(event) = self.replication_rx.recv() => self.handle_replica_event(event).await,
+                Ok(_) = &mut self.core.rx_shutdown => self.core.set_target_state(State::Shutdown),
             }
         }
     }
